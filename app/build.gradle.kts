@@ -1,6 +1,4 @@
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
+
 
 plugins {
     autowire(libs.plugins.android.application)
@@ -12,14 +10,13 @@ plugins {
 android {
     namespace = property.project.app.packageName
     compileSdk = property.project.android.compileSdk
-    val ver = SimpleDateFormat("yyyyMMdd", Locale.CHINA)
-        .format(Date())
+    val gitVersion = GitVersion.getVersion()
     defaultConfig {
         applicationId = property.project.app.packageName
         minSdk = property.project.android.minSdk
         targetSdk = property.project.android.targetSdk
-        versionName = ver
-        versionCode =ver.toInt()
+        versionName = gitVersion[0]
+        versionCode = gitVersion[1].toInt()
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
     buildTypes {
@@ -52,6 +49,8 @@ android {
     lint { checkReleaseBuilds = false }
     //androidResources.additionalParameters += listOf("--allow-reserved-package-id", "--package-id", "0x80")
 }
+
+
 
 tasks.register("printReleaseInfo") {
     doLast {
