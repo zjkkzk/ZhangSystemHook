@@ -23,6 +23,10 @@ object AudioCommunicationModeHooker : YukiBaseHooker() {
     private const val FORCE_NORMAL_DELAY_MS = 600L
     private val forceNormalPending = AtomicBoolean(false)
     private val syncingVolumeAlias = AtomicBoolean(false)
+    // ColorOS 音量索引范围大（MUSIC=160 级），通话/SCO 只有几档；换算用缓存（syncing 保护下读取真实 max）
+    private var cachedMusicMaxVolume = 0
+    private var cachedVoiceCallMaxVolume = 0
+    private var cachedScoMaxVolume = 0
     private val correctionHandler: Handler by lazy {
         Handler(HandlerThread("AudioModeCorrector").apply { start() }.looper)
     }
@@ -674,6 +678,17 @@ object AudioCommunicationModeHooker : YukiBaseHooker() {
                         if (communicationModeBlocked() && !syncingVolumeAlias.get()) {
                             val stream = args.getOrNull(0) as? Int
                             if (stream != null && isCallVolumeStream(stream)) {
+                                // setStreamVolume 族的参数 1 是索引：从通话/SCO 档位等比换算到媒体档位，
+                                // 避免把 1..9 直接当 1..160 导致媒体音量几乎静音
+                                val index = args.getOrNull(1) as? Int
+                                if (index != null && cachedMusicMaxVolume > 0) {
+                                    val fromMax = when (stream) {
+                                        AudioManager.STREAM_VOICE_CALL ->
+                                            if (cachedVoiceCallMaxVolume > 0) cachedVoiceCallMaxVolume else 9
+                                        else -> if (cachedScoMaxVolume > 0) cachedScoMaxVolume else 15
+                                    }
+                                    args[1] = scaleIndex(index, 1, fromMax, 0, cachedMusicMaxVolume)
+                                }
                                 args[0] = AudioManager.STREAM_MUSIC
                                 HookLog.i(
                                     "AudioMode",
@@ -692,7 +707,15 @@ object AudioCommunicationModeHooker : YukiBaseHooker() {
     private fun isCallVolumeStream(stream: Int): Boolean =
         stream == AudioManager.STREAM_VOICE_CALL || stream == 6 // AudioManager.STREAM_BLUETOOTH_SCO = 6
 
-    /** 把 STREAM_VOICE_CALL 索引同步为当前媒体音量，让 VoIP 输出增益跟随音量键。 */
+    /** 把一个音量索引按范围等比映射到另一个范围（避免 clamp 到目标流最大档导致爆音）。 */
+    private fun scaleIndex(index: Int, fromMin: Int, fromMax: Int, toMin: Int, toMax: Int): Int {
+        if (fromMax <= fromMin || toMax <= toMin) return index
+        val span = fromMax - fromMin
+        val normalized = (index - fromMin).coerceIn(0, span)
+        return toMin + ((normalized.toLong() * (toMax - toMin) + span / 2) / span).toInt()
+    }
+
+    /** 把媒体音量按比例同步到 STREAM_VOICE_CALL / BLUETOOTH_SCO，让 VoIP 输出增益跟随音量键且不爆音。 */
     private fun syncVoiceCallToMusic(service: Any?) {
         val context = findContext(service) ?: return
         val audioManager = runCatching { context.getSystemService(AudioManager::class.java) }.getOrNull() ?: return
@@ -700,9 +723,29 @@ object AudioCommunicationModeHooker : YukiBaseHooker() {
         try {
             val musicIndex = runCatching { audioManager.getStreamVolume(AudioManager.STREAM_MUSIC) }.getOrNull()
                 ?: return
-            runCatching { audioManager.setStreamVolume(AudioManager.STREAM_VOICE_CALL, musicIndex, 0) }
-                .onFailure { HookLog.e(TAG, "[VolumeAlias] sync failed", it) }
-            HookLog.i(TAG, "[VolumeAlias] SYNC voiceCall=$musicIndex")
+            // syncingVolumeAlias 保护下读取的是真实 max，不会被别名 hook 改写
+            if (cachedMusicMaxVolume <= 0) {
+                cachedMusicMaxVolume =
+                    runCatching { audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC) }.getOrDefault(0)
+            }
+            if (cachedVoiceCallMaxVolume <= 0) {
+                cachedVoiceCallMaxVolume =
+                    runCatching { audioManager.getStreamMaxVolume(AudioManager.STREAM_VOICE_CALL) }.getOrDefault(0)
+            }
+            if (cachedScoMaxVolume <= 0) {
+                cachedScoMaxVolume = runCatching { audioManager.getStreamMaxVolume(6) }.getOrDefault(0)
+            }
+            if (cachedMusicMaxVolume <= 0 || cachedVoiceCallMaxVolume <= 0) return
+            val voiceCallIndex = scaleIndex(musicIndex, 0, cachedMusicMaxVolume, 1, cachedVoiceCallMaxVolume)
+            runCatching { audioManager.setStreamVolume(AudioManager.STREAM_VOICE_CALL, voiceCallIndex, 0) }
+                .onFailure { HookLog.e(TAG, "[VolumeAlias] sync voiceCall failed", it) }
+            var scoIndex = -1
+            if (cachedScoMaxVolume > 0) {
+                scoIndex = scaleIndex(musicIndex, 0, cachedMusicMaxVolume, 1, cachedScoMaxVolume)
+                runCatching { audioManager.setStreamVolume(6, scoIndex, 0) }
+                    .onFailure { HookLog.e(TAG, "[VolumeAlias] sync sco failed", it) }
+            }
+            HookLog.i(TAG, "[VolumeAlias] SYNC music=$musicIndex voiceCall=$voiceCallIndex sco=$scoIndex")
         } finally {
             syncingVolumeAlias.set(false)
         }
