@@ -35,7 +35,6 @@ import com.highcapable.yukihookapi.hook.xposed.prefs.data.PrefsData
 import de.robv.android.xposed.XposedHelpers
 import io.github.fairyxh.ZhangSystemHook.BuildConfig
 import io.github.fairyxh.ZhangSystemHook.application.BootStateChecker.isBootCompletedAndUnlocked
-import io.github.fairyxh.ZhangSystemHook.application.DefaultApplication.Companion.context
 import io.github.fairyxh.ZhangSystemHook.application.SystemNotifier
 import io.github.fairyxh.ZhangSystemHook.bean.AppFiltersType
 import io.github.fairyxh.ZhangSystemHook.bean.AppInfoBean
@@ -115,7 +114,9 @@ object AccessibilityHooker : YukiBaseHooker() {
         refreshPolicyCallback = ::refreshPolicy
 
         val pkgName = {
-            val ctx = context
+            // system_server 进程不会实例化模块 Application，DefaultApplication.context 永远未初始化；
+            // 直接使用 system_server 的 systemContext，避免回调抛 UninitializedPropertyAccessException
+            val ctx = systemContext
             val now = SystemClock.elapsedRealtime()
             if (now - bootStateCheckedAt.get() >= 5_000L) {
                 if (bootStateCheckedAt.compareAndSet(bootStateCheckedAt.get(), now)) {
