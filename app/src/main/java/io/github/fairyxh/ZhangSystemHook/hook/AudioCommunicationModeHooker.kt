@@ -22,6 +22,7 @@ object AudioCommunicationModeHooker : YukiBaseHooker() {
     private const val TAG = "AudioBlocker"
     private const val FORCE_NORMAL_DELAY_MS = 600L
     private val forceNormalPending = AtomicBoolean(false)
+    private val syncingVolumeAlias = AtomicBoolean(false)
     private val correctionHandler: Handler by lazy {
         Handler(HandlerThread("AudioModeCorrector").apply { start() }.looper)
     }
@@ -44,6 +45,7 @@ object AudioCommunicationModeHooker : YukiBaseHooker() {
         hookMethods(audioService, "startBluetoothScoVirtualCall")
         hookMethods(audioService, "stopBluetoothSco")
         hookVolumeSelection(audioService)
+        hookVolumeAliasToMusic(audioService)
         hookPhoneState()
         hookEarpieceDisable()
         HookLog.i(TAG, "[Audio] AudioService hook scan completed")
@@ -114,7 +116,10 @@ object AudioCommunicationModeHooker : YukiBaseHooker() {
                     before {
                         val modeIndex = firstIntParameterIndex(method)
                         val requested = if (modeIndex >= 0) args.getOrNull(modeIndex) as? Int else null
-                        if (requested != null && isCallMode(requested) && communicationModeBlocked()) {
+                        // 仅拦截第三方 app 持有的通话模式；Telephony 等系统模式放行（真实电话不受影响）
+                        if (requested != null && isCallMode(requested) && communicationModeBlocked() &&
+                            isAppOwnedCallMode(instance)
+                        ) {
                             args[modeIndex] = AudioManager.MODE_NORMAL
                             HookLog.i(
                                 "AudioMode",
@@ -134,9 +139,11 @@ object AudioCommunicationModeHooker : YukiBaseHooker() {
         }
     }
 
-    /** 兜底：mMode 已进入通话/通信模式时，强行切回 MODE_NORMAL（不分调用方）。 */
+    /** 兜底：第三方 app 持有的通话/通信模式已进入 mMode 时，强行切回 MODE_NORMAL。 */
     private fun forceNormalIfNeeded(audioService: Any?, context: Context?) {
         if (!communicationModeBlocked()) return
+        // 系统（Telephony）持有的真实通话模式一律不动
+        if (!isAppOwnedCallMode(audioService)) return
         val mode = readMode(audioService) ?: return
         if (!isCallMode(mode)) return
         if (!forceNormalPending.compareAndSet(false, true)) return
@@ -182,7 +189,9 @@ object AudioCommunicationModeHooker : YukiBaseHooker() {
                     before {
                         val modeIndex = firstIntParameterIndex(method)
                         val requested = if (modeIndex >= 0) args.getOrNull(modeIndex) as? Int else null
-                        if (requested != null && isCallMode(requested) && communicationModeBlocked()) {
+                        if (requested != null && isCallMode(requested) && communicationModeBlocked() &&
+                            isAppOwnedCallMode(instance)
+                        ) {
                             args[modeIndex] = AudioManager.MODE_NORMAL
                             HookLog.i(
                                 "AudioMode",
@@ -278,12 +287,30 @@ object AudioCommunicationModeHooker : YukiBaseHooker() {
                 method.hook {
                     before {
                         if (communicationModeBlocked() && args.getOrNull(1) == false) {
-                            args[1] = true
-                            HookLog.i(
-                                TAG,
-                                "[Speaker] FORCE_SPEAKER_ON ${method.name}${method.parameterTypes.contentToString()} " +
-                                    "args=${args.contentToString()}"
-                            )
+                            val context = findContext(instance)
+                            val uid = Binder.getCallingUid()
+                            val privileged = context?.let { hasRoutingPrivilege(it) } ?: true
+                            val systemApp = isSystemApplication(context, uid)
+                            val bluetoothActive = runCatching {
+                                context?.getSystemService(AudioManager::class.java)?.communicationDevice
+                                    ?.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+                            }.getOrDefault(false)
+                            // 系统/特权调用与蓝牙耳机场景放行，避免切回扬声器打断蓝牙音频
+                            if (!privileged && !systemApp && !bluetoothActive) {
+                                args[1] = true
+                                HookLog.i(
+                                    TAG,
+                                    "[Speaker] FORCE_SPEAKER_ON ${method.name}${method.parameterTypes.contentToString()} " +
+                                        "args=${args.contentToString()}"
+                                )
+                            } else {
+                                HookLog.i(
+                                    TAG,
+                                    "[Speaker] ALLOW off uid=$uid pkg=${resolvePackageName(context, uid)} " +
+                                        "privileged=$privileged systemApp=$systemApp bluetooth=$bluetoothActive " +
+                                        "${method.name}${method.parameterTypes.contentToString()}"
+                                )
+                            }
                         }
                     }
                 }
@@ -318,7 +345,9 @@ object AudioCommunicationModeHooker : YukiBaseHooker() {
                 method.isAccessible = true
                 method.hook {
                     before {
-                        if (communicationModeBlocked()) {
+                        // setPhoneState 是 framework 内部提交点，正常只有系统进程调用；
+                        // 仅防御第三方应用反射调用，系统（Telephony）真实电话不受影响
+                        if (communicationModeBlocked() && Binder.getCallingUid() >= Process.FIRST_APPLICATION_UID) {
                             val state = firstInt(args)
                             if (state != null && isCallMode(state)) {
                                 result = -1
@@ -443,6 +472,33 @@ object AudioCommunicationModeHooker : YukiBaseHooker() {
                 )
                 return
             }
+            // 系统/特权调用（SystemUI 设备选择、蓝牙服务）放行，用户主动切换蓝牙/耳机不受干扰
+            if (privileged || systemApp) {
+                HookLog.i(
+                    TAG,
+                    "[CommunicationDevice] ALLOW system/privileged uid=$uid pkg=$packageName " +
+                        "requestedDeviceId=$requestedDeviceId resolvedType=${resolvedDevice?.type}"
+                )
+                return
+            }
+            // 默认路由（deviceId=0）交给系统决策，蓝牙自动连接后默认路由不再被改写成扬声器
+            if (requestedDeviceId == 0) {
+                HookLog.i(
+                    TAG,
+                    "[CommunicationDevice] ALLOW default routing uid=$uid pkg=$packageName " +
+                        "resolvedType=${resolvedDevice?.type}"
+                )
+                return
+            }
+            // 蓝牙耳机是用户明确使用的设备，放行
+            if (resolvedDevice?.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO) {
+                HookLog.i(
+                    TAG,
+                    "[CommunicationDevice] ALLOW bluetooth uid=$uid pkg=$packageName " +
+                        "requestedDeviceId=$requestedDeviceId resolvedType=${resolvedDevice?.type}"
+                )
+                return
+            }
             val speaker = devices.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER }
             if (speaker == null) {
                 HookLog.w(
@@ -483,6 +539,8 @@ object AudioCommunicationModeHooker : YukiBaseHooker() {
         val uid = Binder.getCallingUid()
         val context = findContext(audioService)
         val packageName = resolvePackageName(context, uid)
+        val privileged = context?.let { hasRoutingPrivilege(it) } ?: true
+        val systemApp = isSystemApplication(context, uid)
         val enabled = communicationModeBlocked()
         val requested = args.getOrNull(1) as? AudioDeviceInfo
         if (requested == null) {
@@ -496,6 +554,15 @@ object AudioCommunicationModeHooker : YukiBaseHooker() {
             HookLog.i(
                 TAG,
                 "[CommunicationDevice] ALLOW uid=$uid pkg=$packageName requestedType=${requested.type} enabled=$enabled"
+            )
+            return
+        }
+        // 系统/特权调用与蓝牙设备放行，仅第三方明确请求听筒等设备时强制扬声器
+        if (privileged || systemApp || requested.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO) {
+            HookLog.i(
+                TAG,
+                "[CommunicationDevice] ALLOW system/privileged/bluetooth uid=$uid pkg=$packageName " +
+                    "requestedType=${requested.type} privileged=$privileged systemApp=$systemApp"
             )
             return
         }
@@ -568,10 +635,77 @@ object AudioCommunicationModeHooker : YukiBaseHooker() {
                             )
                         }
                     }
+                    after {
+                        // VoIP 实际增益走 STREAM_VOICE_CALL；媒体音量调整后同步通话音量索引，
+                        // 保证 App 通话中音量键立即生效（循环由 syncingVolumeAlias 保护）
+                        if (communicationModeBlocked() && !syncingVolumeAlias.get()) {
+                            syncVoiceCallToMusic(instance)
+                        }
+                    }
                 }
                 HookLog.i(TAG, "[Audio] installed ${method.name}${method.parameterTypes.contentToString()}")
             }
         }.onFailure { HookLog.e(TAG, "[Audio] failed to hook adjustStreamVolume family", it) }
+    }
+
+    /**
+     * 通话/蓝牙 SCO 音量流别名到媒体流：get/set/max 读写全部映射 STREAM_MUSIC。
+     * VoIP（USAGE_VOICE_COMMUNICATION）的音量索引在 AudioService 中绑定 STREAM_VOICE_CALL，
+     * 而强制普通模式后音量键调整的是 STREAM_MUSIC；不别名的话 App 通话音量永远无效。
+     */
+    private fun hookVolumeAliasToMusic(clazz: Class<*>) {
+        runCatching {
+            val candidates = allMethods(clazz)
+                .filter { method ->
+                    (method.name == "getStreamVolume" || method.name == "getStreamMaxVolume" ||
+                        method.name.startsWith("setStreamVolume")) &&
+                        method.parameterTypes.isNotEmpty() &&
+                        method.parameterTypes[0] == Int::class.javaPrimitiveType
+                }
+                .distinctBy(Method::toGenericString)
+            if (candidates.isEmpty()) {
+                HookLog.w(TAG, "[VolumeAlias] candidate not found: getStreamVolume/setStreamVolume family")
+                return
+            }
+            candidates.forEach { method ->
+                method.isAccessible = true
+                method.hook {
+                    before {
+                        if (communicationModeBlocked() && !syncingVolumeAlias.get()) {
+                            val stream = args.getOrNull(0) as? Int
+                            if (stream != null && isCallVolumeStream(stream)) {
+                                args[0] = AudioManager.STREAM_MUSIC
+                                HookLog.i(
+                                    "AudioMode",
+                                    "[VolumeAlias] REWRITE_STREAM_TO_MUSIC " +
+                                        "${method.name}${method.parameterTypes.contentToString()} stream=$stream"
+                                )
+                            }
+                        }
+                    }
+                }
+                HookLog.i(TAG, "[VolumeAlias] installed ${method.name}${method.parameterTypes.contentToString()}")
+            }
+        }.onFailure { HookLog.e(TAG, "[VolumeAlias] failed to hook volume alias family", it) }
+    }
+
+    private fun isCallVolumeStream(stream: Int): Boolean =
+        stream == AudioManager.STREAM_VOICE_CALL || stream == 6 // AudioManager.STREAM_BLUETOOTH_SCO = 6
+
+    /** 把 STREAM_VOICE_CALL 索引同步为当前媒体音量，让 VoIP 输出增益跟随音量键。 */
+    private fun syncVoiceCallToMusic(service: Any?) {
+        val context = findContext(service) ?: return
+        val audioManager = runCatching { context.getSystemService(AudioManager::class.java) }.getOrNull() ?: return
+        if (!syncingVolumeAlias.compareAndSet(false, true)) return
+        try {
+            val musicIndex = runCatching { audioManager.getStreamVolume(AudioManager.STREAM_MUSIC) }.getOrNull()
+                ?: return
+            runCatching { audioManager.setStreamVolume(AudioManager.STREAM_VOICE_CALL, musicIndex, 0) }
+                .onFailure { HookLog.e(TAG, "[VolumeAlias] sync failed", it) }
+            HookLog.i(TAG, "[VolumeAlias] SYNC voiceCall=$musicIndex")
+        } finally {
+            syncingVolumeAlias.set(false)
+        }
     }
 
     /**
@@ -793,11 +927,14 @@ object AudioCommunicationModeHooker : YukiBaseHooker() {
         val packageName = resolvePackageName(context, uid)
         val acquisition = when (methodName) {
             "setMode" -> firstInt(args)?.let { isCallMode(it) } ?: false
-            "startBluetoothSco", "startBluetoothScoVirtualCall" -> true
+            // 蓝牙 SCO 是蓝牙耳机的正常音频链路，必须放行；禁止的是通话/通信模式本身
+            "startBluetoothSco", "startBluetoothScoVirtualCall" -> false
             "stopBluetoothSco" -> false
             else -> false
         }
-        val block = enabled && acquisition
+        // 系统/特权调用（Telephony、SystemUI、蓝牙服务）放行，避免误伤真实电话与用户主动切换
+        val systemCall = privileged || systemApp
+        val block = enabled && acquisition && !systemCall
         return Decision(uid, packageName, enabled, privileged, block, describeState(audioService, context))
     }
 
@@ -835,6 +972,31 @@ object AudioCommunicationModeHooker : YukiBaseHooker() {
         }
         null
     }.getOrNull()
+
+    /** 当前通话/通信模式的持有者 uid；无法判定时返回 null（调用方需 fail-open）。 */
+    private fun currentModeOwnerUid(service: Any?): Int? = runCatching {
+        val field = generateSequence(service?.javaClass) { it.superclass }
+            .flatMap { it.declaredFields.asSequence() }
+            .firstOrNull { it.name == "mSetModeDeathHandlers" }
+            ?: return null
+        field.isAccessible = true
+        val handlers = field.get(service) as? List<*> ?: return null
+        for (handler in handlers) {
+            if (handler == null) continue
+            val mode = invokeInt(handler, "getMode") ?: continue
+            if (!isCallMode(mode)) continue
+            invokeInt(handler, "getUid")?.let { return it }
+            readIntField(handler, "mUid")?.let { return it }
+            return null
+        }
+        null
+    }.getOrNull()
+
+    /** 通话/通信模式是否由第三方 app（非系统）持有。 */
+    private fun isAppOwnedCallMode(service: Any?): Boolean {
+        val uid = currentModeOwnerUid(service) ?: return false
+        return uid >= Process.FIRST_APPLICATION_UID
+    }
 
     private fun invokeObject(service: Any?, name: String): Any? = runCatching {
         val method = generateSequence(service?.javaClass) { it.superclass }
