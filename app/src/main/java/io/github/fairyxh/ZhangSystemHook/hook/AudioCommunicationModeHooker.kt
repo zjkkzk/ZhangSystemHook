@@ -731,6 +731,12 @@ object AudioCommunicationModeHooker : YukiBaseHooker() {
             return
         }
         audioSystemClass = audioSystem
+        // Android 14+ 新签名 setDeviceConnectionState(AudioDeviceAttributes, int, int) 的设备类型
+        // 在 attributes 中，旧签名 (int, int, ...) 参数 0 才是设备类型；不能用 firstInt 以免把
+        // state=AVAILABLE(1) 误判成听筒导致蓝牙 SCO/A2DP 连接被强制断开
+        val attributesClass = runCatching {
+            "android.media.AudioDeviceAttributes".toClass()
+        }.getOrNull()
         val setters = runCatching {
             allMethods(audioSystem).filter { it.name.startsWith("setDeviceConnectionState") }
                 .distinctBy(Method::toGenericString)
@@ -747,7 +753,15 @@ object AudioCommunicationModeHooker : YukiBaseHooker() {
                 method.hook {
                     before {
                         if (communicationModeBlocked()) {
-                            val device = firstInt(args)
+                            val device = when {
+                                method.parameterTypes.isNotEmpty() &&
+                                    method.parameterTypes[0] == Int::class.javaPrimitiveType ->
+                                    args.getOrNull(0) as? Int
+                                attributesClass != null && method.parameterTypes.isNotEmpty() &&
+                                    method.parameterTypes[0] == attributesClass ->
+                                    args.getOrNull(0)?.let { invokeInt(it, "getType") }
+                                else -> null
+                            }
                             val state = if (method.parameterTypes.size >= 2 &&
                                 method.parameterTypes[1] == Int::class.javaPrimitiveType
                             ) {
