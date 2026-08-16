@@ -678,23 +678,86 @@ object AudioCommunicationModeHooker : YukiBaseHooker() {
                         if (communicationModeBlocked() && !syncingVolumeAlias.get()) {
                             val stream = args.getOrNull(0) as? Int
                             if (stream != null && isCallVolumeStream(stream)) {
-                                // setStreamVolume 族的参数 1 是索引：从通话/SCO 档位等比换算到媒体档位，
-                                // 避免把 1..9 直接当 1..160 导致媒体音量几乎静音
+                                val uid = Binder.getCallingUid()
                                 val index = args.getOrNull(1) as? Int
-                                if (index != null && cachedMusicMaxVolume > 0) {
-                                    val fromMax = when (stream) {
-                                        AudioManager.STREAM_VOICE_CALL ->
-                                            if (cachedVoiceCallMaxVolume > 0) cachedVoiceCallMaxVolume else 9
-                                        else -> if (cachedScoMaxVolume > 0) cachedScoMaxVolume else 15
+                                if (uid < Process.FIRST_APPLICATION_UID) {
+                                    // 系统内部调用（音量限制模块的 100ms 校正循环、系统恢复音量等）一律放行：
+                                    // 别名会把 VOICE_CALL/SCO 设置放大成媒体音量，配合音量限制时媒体音量会被
+                                    // 突然抬到限制值（微信语音/高德导航复现）；放行也避免 get/getMax 别名污染
+                                    // 其他模块对真实通话流最大值的缓存。
+                                    HookLog.i(
+                                        "AudioMode",
+                                        "[VolumeAlias] ALLOW_SYSTEM_INTERNAL " +
+                                            "${method.name}${method.parameterTypes.contentToString()} " +
+                                            "stream=$stream uid=$uid"
+                                    )
+                                } else if (index == null) {
+                                    // App 读取通话/SCO 音量：别名到媒体流，让 App 音量 UI 显示媒体音量
+                                    args[0] = AudioManager.STREAM_MUSIC
+                                    HookLog.i(
+                                        "AudioMode",
+                                        "[VolumeAlias] READ_AS_MUSIC " +
+                                            "${method.name}${method.parameterTypes.contentToString()} " +
+                                            "stream=$stream uid=$uid"
+                                    )
+                                } else {
+                                    // App 显式设置通话/SCO 流：通信音频强制按媒体音量播放。
+                                    // 旧逻辑把通话档位等比放大成媒体档位（如 setStreamVolume(VOICE_CALL, 9)
+                                    // -> setStreamVolume(MUSIC, 160)），配合音量限制模块会把媒体音量突然
+                                    // 抬到限制值；现在只把通话流同步到当前媒体音量的比例，绝不改写媒体音量。
+                                    val audioManager = findContext(instance)
+                                        ?.getSystemService(AudioManager::class.java)
+                                    if (audioManager == null) {
+                                        HookLog.w(
+                                            TAG,
+                                            "[VolumeAlias] AudioManager unavailable; ALLOW set stream=$stream uid=$uid"
+                                        )
+                                    } else {
+                                        if (cachedMusicMaxVolume <= 0) {
+                                            cachedMusicMaxVolume = runCatching {
+                                                audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+                                            }.getOrDefault(0)
+                                        }
+                                        val fromMax = when (stream) {
+                                            AudioManager.STREAM_VOICE_CALL -> {
+                                                if (cachedVoiceCallMaxVolume <= 0) {
+                                                    cachedVoiceCallMaxVolume = runCatching {
+                                                        audioManager.getStreamMaxVolume(AudioManager.STREAM_VOICE_CALL)
+                                                    }.getOrDefault(0)
+                                                }
+                                                if (cachedVoiceCallMaxVolume > 0) cachedVoiceCallMaxVolume else 9
+                                            }
+                                            else -> {
+                                                if (cachedScoMaxVolume <= 0) {
+                                                    cachedScoMaxVolume = runCatching {
+                                                        audioManager.getStreamMaxVolume(6)
+                                                    }.getOrDefault(0)
+                                                }
+                                                if (cachedScoMaxVolume > 0) cachedScoMaxVolume else 15
+                                            }
+                                        }
+                                        val currentMusic = runCatching {
+                                            audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
+                                        }.getOrNull()
+                                        if (cachedMusicMaxVolume <= 0 || currentMusic == null) {
+                                            // 媒体音量状态未知时 fail-open：不放大也不改写
+                                            HookLog.w(
+                                                TAG,
+                                                "[VolumeAlias] music state unknown; ALLOW set stream=$stream index=$index uid=$uid"
+                                            )
+                                        } else {
+                                            val expected =
+                                                scaleIndex(currentMusic, 0, cachedMusicMaxVolume, 1, fromMax)
+                                            args[1] = expected
+                                            HookLog.i(
+                                                "AudioMode",
+                                                "[VolumeAlias] CLAMP_TO_MEDIA " +
+                                                    "${method.name}${method.parameterTypes.contentToString()} " +
+                                                    "stream=$stream requested=$index -> $expected music=$currentMusic uid=$uid"
+                                            )
+                                        }
                                     }
-                                    args[1] = scaleIndex(index, 1, fromMax, 0, cachedMusicMaxVolume)
                                 }
-                                args[0] = AudioManager.STREAM_MUSIC
-                                HookLog.i(
-                                    "AudioMode",
-                                    "[VolumeAlias] REWRITE_STREAM_TO_MUSIC " +
-                                        "${method.name}${method.parameterTypes.contentToString()} stream=$stream"
-                                )
                             }
                         }
                     }
